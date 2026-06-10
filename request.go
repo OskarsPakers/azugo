@@ -104,19 +104,9 @@ func (a *App) acquireCtx(m *mux, path string, c *fasthttp.RequestCtx) *Context {
 
 	ctx.routerPath = path
 
-	if ctx.method == fasthttp.MethodPost || ctx.method == fasthttp.MethodPut || ctx.method == fasthttp.MethodPatch {
-		if bytes.HasPrefix(c.Request.Header.ContentType(), contentTypeFormURLEncoded) {
-			ctx.Form.form = &postArgs{
-				args: c.Request.PostArgs(),
-			}
-		} else if bytes.HasPrefix(c.Request.Header.ContentType(), contentTypeMultipartFormData) {
-			if form, err := c.Request.MultipartForm(); err == nil {
-				ctx.Form.form = &multiPartArgs{
-					args: form,
-				}
-			}
-		}
-	}
+	// The form is parsed lazily on first access (see FormCtx.ensure) so that
+	// routes which do not read it avoid multipart parsing and so that parse
+	// failures reach the handler.
 
 	// Ignore error
 	ctx.requestID, _ = ulid.New(ulid.Timestamp(time.Now().UTC()), a.entropy)
@@ -167,6 +157,8 @@ func Handle(h Handler) RequestHandler {
 func (c *Context) reset() {
 	c.Form.form.Reset(c)
 	c.Form.form = nilArgsValuer
+	c.Form.parsed = false
+	c.Form.err = nil
 	c.user = nil
 	c.context = nil
 	c.mux = nil

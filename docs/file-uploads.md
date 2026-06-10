@@ -3,18 +3,20 @@
 This document explains how multipart/file uploads work in Azugo, why a writable
 temporary directory is required, and how to build robust upload routes. It exists
 because uploads can silently appear "cut off" (empty form, missing files) when the
-temp directory is unavailable or the body exceeds the default size limit.
+temporary directory is unavailable.
 
 ## TL;DR
 
-- Uploads larger than the in-memory threshold are streamed to **temporary files in
-  the OS temp directory** (`$TMPDIR`, default `/tmp`). That directory **must exist
-  and be writable** by the process, or multipart parsing fails.
-- When parsing fails, Azugo currently **swallows the error** and the handler sees an
-  **empty form** — not an error. This is the usual cause of "the upload got cut off".
-- The fasthttp default request body limit is **4 MB**. Anything larger is rejected at
-  the transport layer. Azugo does not yet expose a knob to raise it (see
-  [Known limitations](#known-limitations)).
+- Uploads are **not** limited to 4 MB. Request bodies are streamed, and file parts
+  larger than the in-memory threshold are written to **temporary files in the OS temp
+  directory** (`$TMPDIR`, default `/tmp`). That directory **must exist and be writable**
+  by the process, or multipart parsing fails.
+- A failed parse (e.g. unwritable temp dir, malformed body, exceeded size limit) now
+  surfaces as a `FormParseError` from the `ctx.Form` accessors and from
+  `ctx.Form.Parse()`. This is the usual cause of "the upload got cut off".
+- Uploads are unbounded by default. Set `ServerOptions.MaxMultipartFormSize` to cap
+  them; larger uploads then fail with a `FormParseError` wrapping
+  `fasthttp.ErrBodyTooLarge`.
 - Always validate size, content type, and filename, and never use an uploaded file
   after the handler returns (its temp file is removed on request cleanup).
 
@@ -26,67 +28,53 @@ The HTTP server is configured (in `app.go`) with:
 server := &fasthttp.Server{
     StreamRequestBody:            true,  // body is streamed, large parts spill to disk
     DisablePreParseMultipartForm: true,  // multipart is parsed lazily, not during read
-    // MaxRequestBodySize is NOT set -> fasthttp default of 4 MB applies
 }
 ```
 
-For every `POST`/`PUT`/`PATCH` with `Content-Type: multipart/form-data`, Azugo eagerly
-parses the form when it builds the request context (`request.go`):
+Because the body is streamed, the server-wide body limit does **not** reject large
+uploads — an oversized body is turned into a stream and read on demand. That is why
+uploads larger than fasthttp's 4 MB default work.
 
-```go
-} else if bytes.HasPrefix(c.Request.Header.ContentType(), contentTypeMultipartFormData) {
-    if form, err := c.Request.MultipartForm(); err == nil { // NOTE: error is ignored
-        ctx.Form.form = &multiPartArgs{args: form}
-    }
-}
-```
+The form is parsed **lazily**, the first time a handler touches `ctx.Form`. Parsing
+reads the multipart stream and writes any file part larger than the in-memory threshold
+to a **temporary file** created in the OS temp directory (`os.CreateTemp("", ...)` →
+`$TMPDIR`, default `/tmp`). Routes that never read the form do no parsing and create no
+temp files.
 
-`MultipartForm()` reads the multipart stream and writes any file part larger than the
-in-memory threshold to a **temporary file created in the OS temp directory**
-(`os.CreateTemp("", ...)` → `$TMPDIR`, default `/tmp`). Because `StreamRequestBody` is
-enabled, fasthttp also uses the temp directory to buffer the streamed body itself once
-it grows beyond the read buffer.
-
-Parsed fields and files are then accessed through the `ctx.Form` API:
+Fields and files are accessed through the `ctx.Form` API:
 
 ```go
 ctx.Form.String("title")          // text field
 ctx.Form.File("document")         // single *multipart.FileHeader (required)
 ctx.Form.FileOptional("avatar")   // single *multipart.FileHeader or nil
 ctx.Form.Files("attachments")     // []*multipart.FileHeader
+ctx.Form.Parse()                  // force parsing; returns the parse error, if any
 ```
 
-Temporary files are removed automatically when the request context is released
-(`form.go` calls `Request.RemoveMultipartFormFiles()` on reset). **Do not** keep a
-`*multipart.FileHeader` or an open file past the end of the handler.
+Temporary files are removed automatically when the request context is released. **Do
+not** keep a `*multipart.FileHeader` or an open file past the end of the handler.
 
-## Why "cut off" happens
-
-There are two distinct failure modes, both of which look like a truncated/empty upload
-to the client:
-
-### 1. Temp directory not writable
+## Why "cut off" happens: the temp directory
 
 If `$TMPDIR` (or `/tmp`) does not exist, is read-only, or the process lacks write
-permission, fasthttp cannot spill the file part to disk. `MultipartForm()` returns an
-error, and because Azugo ignores that error, `ctx.Form` is left empty. The handler then
-sees:
+permission, fasthttp cannot spill the file part to disk and multipart parsing fails.
+The handler observes this as a `FormParseError`:
 
-- `ctx.Form.File("document")` → `ParamRequiredError` ("document is required")
-- `ctx.Form.Files(...)` → empty slice
+```go
+fh, err := ctx.Form.File("document")
+// err is a FormParseError when the temp dir is unwritable or the body is malformed,
+// and a ParamRequiredError when the field is simply absent.
+```
 
-…even though the client sent a valid file. This is extremely common in hardened
-container images:
+This is extremely common in hardened container images:
 
 - distroless / `scratch` images that have no `/tmp` directory at all
 - Kubernetes pods with `securityContext.readOnlyRootFilesystem: true`
 - containers where `/tmp` is mounted but not writable by the run-as user
 
-### 2. Body exceeds the size limit
-
-fasthttp's default `MaxRequestBodySize` is **4 MB**. A larger request body is rejected
-or truncated during read, so the multipart parse never completes and you again get an
-empty/partial form.
+> Note: before the lazy-parse change, this error was swallowed and the handler saw an
+> empty form with no indication of the cause. It is now returned from the `ctx.Form`
+> accessors.
 
 ## Required deployment setup
 
@@ -146,33 +134,48 @@ func assertTempWritable() error {
 }
 ```
 
+## Bounding upload size
+
+Uploads are unbounded by default (limited only by available temp storage). To cap them,
+set the limit once when constructing the app:
+
+```go
+app.ServerOptions.MaxMultipartFormSize = 32 << 20 // 32 MiB
+```
+
+An upload exceeding the limit fails when the form is accessed with a `FormParseError`
+that wraps `fasthttp.ErrBodyTooLarge` (and maps to HTTP 400 via `ctx.Error`).
+
 ## Writing an upload route
 
 ```go
 func uploadHandler(ctx *azugo.Context) {
-    // Required text field alongside the file.
+    // Surface a parse failure (unwritable temp dir, oversized upload, malformed body)
+    // before treating a missing file as a client error.
+    if err := ctx.Form.Parse(); err != nil {
+        ctx.Error(err) // FormParseError -> 400
+        return
+    }
+
     title, err := ctx.Form.String("title")
     if err != nil {
-        ctx.Error(err) // ParamRequiredError -> 400
+        ctx.Error(err)
         return
     }
 
     fh, err := ctx.Form.File("document")
     if err != nil {
-        // NOTE: this also fires when the temp dir was unwritable, because the
-        // form ends up empty. See "Distinguishing a real error" below.
         ctx.Error(err)
         return
     }
 
-    // Validate BEFORE trusting anything from the client.
+    // Validate before trusting anything from the client.
     const maxSize = 10 << 20 // 10 MiB
     if fh.Size > maxSize {
         ctx.StatusCode(fasthttp.StatusRequestEntityTooLarge)
         return
     }
 
-    // Open the part (this may be an in-memory part or a temp file on disk).
     src, err := fh.Open()
     if err != nil {
         ctx.Error(err)
@@ -183,8 +186,7 @@ func uploadHandler(ctx *azugo.Context) {
     // Sanitise the filename — never use fh.Filename directly in a path.
     safeName := filepath.Base(filepath.Clean("/" + fh.Filename))
 
-    // Persist to your storage. Do this within the handler; the temp file is
-    // removed when the request completes.
+    // Persist within the handler; the temp file is removed when the request completes.
     dst, err := os.Create(filepath.Join(storageDir, safeName))
     if err != nil {
         ctx.Error(err)
@@ -215,46 +217,25 @@ for _, fh := range ctx.Form.Files("attachments") {
 }
 ```
 
-### Distinguishing a real error from an empty form
-
-Because Azugo discards the multipart parse error, a missing file and an unwritable temp
-dir look identical at the `ctx.Form` layer. If you need to tell them apart (e.g. to
-return `500` instead of `400`, or to log the real cause), re-trigger the parse via the
-underlying fasthttp request, which returns the error:
-
-```go
-if _, err := ctx.Request().MultipartForm(); err != nil {
-    ctx.Log().With(zap.Error(err)).Error("multipart parse failed (check temp dir / body size)")
-    ctx.StatusCode(fasthttp.StatusInternalServerError)
-    return
-}
-```
-
 ## Security checklist
 
-- **Validate size** per file and in aggregate; reject early.
+- **Bound upload size** via `ServerOptions.MaxMultipartFormSize`, and validate per-file
+  sizes in the handler.
 - **Do not trust the client `Content-Type`** — sniff the content if the type matters.
 - **Sanitise filenames**: use `filepath.Base`, reject path separators and `..`; prefer
   generating your own storage name.
 - **Store uploads outside any served static root** so they can't be requested back as
-  executable/served content.
+  served content.
 - **Cap concurrency** for upload endpoints to bound temp-disk and memory usage.
 - Treat the temp directory as sensitive: other processes on the host should not be able
   to read in-flight upload spill files.
 
-## Known limitations
+## Reference
 
-These are framework-level gaps to be aware of (and good candidates for improvement):
-
-1. **Multipart parse errors are swallowed** (`request.go`): a failed parse yields an
-   empty form rather than surfacing the error. Until this is changed, use the
-   "Distinguishing a real error" pattern above for diagnostics.
-2. **`MaxRequestBodySize` is not configurable** via `ServerOptions`: the fasthttp 4 MB
-   default applies to all requests, so large uploads are rejected. Raising it currently
-   requires a framework change to set `fasthttp.Server.MaxRequestBodySize`.
-3. **The temp directory is not configurable through Azugo**: it follows the Go runtime
-   (`$TMPDIR`/`os.TempDir()`). Control it via the environment as described above.
-
-If your application needs large uploads, raise these as framework enhancements so that
-`MaxRequestBodySize` and the temp directory can be set through `ServerOptions`, and so
-that parse failures are returned rather than silently producing an empty form.
+- `ServerOptions.MaxMultipartFormSize` — maximum multipart body size in bytes; `0` (the
+  default) means no limit.
+- `ctx.Form.Parse() error` — forces parsing and returns the parse error, if any.
+- `FormParseError` — returned by the `ctx.Form` accessors when parsing fails; maps to
+  HTTP 400 and wraps the underlying cause (e.g. `fasthttp.ErrBodyTooLarge`).
+- The temporary directory follows the Go runtime (`$TMPDIR` / `os.TempDir()`); control
+  it via the environment as described above.

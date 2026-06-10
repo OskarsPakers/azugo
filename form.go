@@ -23,9 +23,63 @@ type formKeyValuer interface {
 type FormCtx struct {
 	noCopy noCopy
 
-	form formKeyValuer
+	form   formKeyValuer
+	parsed bool
+	err    error
 
 	ctx *Context
+}
+
+// ensure lazily parses the request form on first access. Parsing is deferred so
+// that routes which never read the form do not pay for multipart parsing (which
+// may spill uploaded files to the temporary directory), and so that a parse
+// failure is surfaced to the handler instead of being silently turned into an
+// empty form.
+func (f *FormCtx) ensure() {
+	if f.parsed {
+		return
+	}
+
+	f.parsed = true
+	f.form = nilArgsValuer
+
+	c := f.ctx.context
+	if c == nil {
+		return
+	}
+
+	switch f.ctx.method {
+	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch:
+	default:
+		return
+	}
+
+	ct := c.Request.Header.ContentType()
+	switch {
+	case bytes.HasPrefix(ct, contentTypeFormURLEncoded):
+		f.form = &postArgs{args: c.Request.PostArgs()}
+	case bytes.HasPrefix(ct, contentTypeMultipartFormData):
+		form, err := c.Request.MultipartFormWithLimit(f.ctx.app.ServerOptions.MaxMultipartFormSize)
+		if err != nil {
+			f.err = FormParseError{Err: err}
+
+			return
+		}
+
+		f.form = &multiPartArgs{args: form}
+	}
+}
+
+// Parse forces the request form to be parsed and returns any parse error.
+// It is safe to call multiple times.
+//
+// Use this when a handler needs to distinguish a malformed or oversized upload,
+// or an unwritable temporary directory, from a simply absent field: those
+// failures return a FormParseError here, whereas a missing field does not.
+func (f *FormCtx) Parse() error {
+	f.ensure()
+
+	return f.err
 }
 
 // nilArgs represents noop form key-value pairs.
@@ -128,12 +182,21 @@ func (a *multiPartArgs) Reset(ctx *Context) {
 
 // Values returns all values associated with the given key in query.
 func (f *FormCtx) Values(key string) []string {
+	f.ensure()
+
 	return f.form.Values(key)
 }
 
 // String gets the first value associated with the given key in form.
-// If there are no values associated with the key or value is empty returns ParamRequiredError error.
+// If the form could not be parsed returns FormParseError. If there are no values
+// associated with the key or value is empty returns ParamRequiredError error.
 func (f *FormCtx) String(key string) (string, error) {
+	f.ensure()
+
+	if f.err != nil {
+		return "", f.err
+	}
+
 	v := f.form.Value(key)
 	if len(v) == 0 {
 		return "", ParamRequiredError{key}
@@ -144,6 +207,8 @@ func (f *FormCtx) String(key string) (string, error) {
 
 // StringOptional gets the first value associated with the given key in query or null if value is empty.
 func (f *FormCtx) StringOptional(key string) *string {
+	f.ensure()
+
 	v := f.form.Value(key)
 	if len(v) == 0 {
 		return nil
@@ -235,7 +300,15 @@ func (f *FormCtx) BoolOptional(key string) (*bool, error) {
 }
 
 // File returns uploaded file data.
+// If the form could not be parsed returns FormParseError. If the file is not
+// provided returns ParamRequiredError.
 func (f *FormCtx) File(key string) (*multipart.FileHeader, error) {
+	f.ensure()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
 	v := f.form.File(key)
 	if v == nil {
 		return nil, ParamRequiredError{key}
@@ -246,10 +319,14 @@ func (f *FormCtx) File(key string) (*multipart.FileHeader, error) {
 
 // FileOptional returns uploaded file data if it's provided.
 func (f *FormCtx) FileOptional(key string) *multipart.FileHeader {
+	f.ensure()
+
 	return f.form.File(key)
 }
 
 // Files returns uploaded files.
 func (f *FormCtx) Files(key string) []*multipart.FileHeader {
+	f.ensure()
+
 	return f.form.Files(key)
 }
