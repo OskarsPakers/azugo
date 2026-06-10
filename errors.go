@@ -130,6 +130,34 @@ func (ParamInvalidError) StatusCode() int {
 	return fasthttp.StatusUnprocessableEntity
 }
 
+// FormParseError is returned when the request form or multipart body cannot be parsed.
+type FormParseError struct {
+	Err error
+}
+
+func (e FormParseError) Error() string {
+	if e.Err == nil {
+		return "form parse failed"
+	}
+
+	return e.Err.Error()
+}
+
+// Unwrap returns the underlying parse error.
+func (e FormParseError) Unwrap() error {
+	return e.Err
+}
+
+// SafeError returns a safe error message for FormParseError.
+func (FormParseError) SafeError() string {
+	return "request form could not be processed"
+}
+
+// StatusCode returns the HTTP status code for FormParseError.
+func (FormParseError) StatusCode() int {
+	return fasthttp.StatusBadRequest
+}
+
 // BadRequestError is an error that occurs when request is malformed.
 type BadRequestError struct {
 	Description string
