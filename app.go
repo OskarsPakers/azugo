@@ -65,6 +65,10 @@ type ServerOptions struct {
 	//
 	// Default buffer size 8K is used if not set.
 	ResponseWriteBufferSize int
+
+	// MaxMultipartFormSize limits the parsed multipart/form-data body size in
+	// bytes. A zero or negative value means no limit.
+	MaxMultipartFormSize int
 }
 
 // New creates a new Azugo application.
