@@ -67,12 +67,17 @@ Opinionated GoLang web framework for microservices based on FastHTTP.
 
 #### Cache
 
+Redis-backed cache types require Redis 6.2 or later, or any Valkey version.
+
 * `CACHE_TYPE` - Cache type to use (defaults to `memory`, allowed values are `memory`, `redis`, `redis-cluster`, `redis-sentinel`).
 * `CACHE_TTL` - Duration to keep items in cache (defaults to `0` meaning never expire).
 * `CACHE_KEY_PREFIX` - Prefix all cache keys with specified value.
 * `CACHE_CONNECTION` - Connection string for non-memory cache backends.
 * `CACHE_PASSWORD` - Password for cache connection.
 * `CACHE_PASSWORD_FILE` - File to read value for `CACHE_PASSWORD` from.
+* `CACHE_CLIENT_CACHE` - Enable server-assisted client-side caching support on Redis connections (defaults to `true`).
+* `CACHE_CLIENT_CACHE_TTL` - Default duration to keep values in the in-process client-side cache (defaults to `0` meaning disabled).
+* `CACHE_CLIENT_CACHE_SIZE` - Client-side cache memory bound in bytes per Redis connection (defaults to `16777216`, i.e. 16 MiB).
 
 ### Special thanks to
 
