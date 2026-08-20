@@ -5,6 +5,8 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"azugo.io/azugo/internal/utils"
@@ -42,6 +44,21 @@ type Context struct {
 	context *fasthttp.RequestCtx
 	// reqCtx is the effective request context installed via SetContext.
 	reqCtx context.Context
+	// reqCtxStop detaches the cancellation bridge installed by SetContext.
+	reqCtxStop func() bool
+
+	// Request lifecycle state, canceled by releaseCtx so that everything
+	// derived from this Context ends with the request
+	cancelMu       sync.Mutex
+	cancelIdle     *sync.Cond
+	doneCh         atomic.Pointer[chan struct{}]
+	ctxErr         error
+	afterFuncs     map[*func()]struct{}
+	gen            uint64
+	pendingCancels int
+	live           bool
+	// touched marks that the lifecycle state above is in use
+	touched atomic.Bool
 
 	method       http.Method // HTTP method
 	path         string      // HTTP path with the modifications by the configuration -> string copy from pathBuffer
@@ -104,6 +121,12 @@ func (a *App) acquireCtx(m *mux, path string, c *fasthttp.RequestCtx) *Context {
 		ctx.Params.ctx = ctx
 	}
 
+	// Heal lifecycle state left behind by a late Done or AfterFunc call that
+	// raced the previous release
+	if ctx.touched.Load() {
+		a.endCtxLifecycle(ctx)
+	}
+
 	// Set method
 	if c != nil {
 		ctx.method = http.Method(utils.B2S(c.Request.Header.Method()))
@@ -149,8 +172,78 @@ func (a *App) acquireCtx(m *mux, path string, c *fasthttp.RequestCtx) *Context {
 }
 
 func (a *App) releaseCtx(ctx *Context) {
+	// Untouched requests skip the lifecycle entirely, healed by the next acquireCtx
+	if ctx.touched.Load() {
+		a.endCtxLifecycle(ctx)
+	}
+
 	ctx.reset()
 	a.ctxPool.Put(ctx)
+}
+
+// endCtxLifecycle cancels everything derived from the Context and restarts
+// its lifecycle state for the next occupant.
+func (a *App) endCtxLifecycle(ctx *Context) {
+	ctx.cancelMu.Lock()
+
+	// Touches after this point belong to the next occupant or to healing
+	ctx.touched.Store(false)
+
+	// Bump the generation
+	ctx.gen++
+
+	live := ctx.live
+	ctx.live = false
+
+	funcs := ctx.afterFuncs
+	ctx.afterFuncs = nil
+
+	if ctx.ctxErr == nil {
+		if d := ctx.doneCh.Load(); d != nil {
+			close(*d)
+		}
+
+		if funcs != nil {
+			// Canceled children read Err while the funcs below run
+			ctx.ctxErr = context.Canceled
+		}
+	}
+
+	wait := funcs != nil || ctx.pendingCancels > 0
+	if !wait {
+		ctx.ctxErr = nil
+	}
+
+	ctx.doneCh.Store(nil)
+	ctx.cancelMu.Unlock()
+
+	if live {
+		a.ctxLiveMu.Lock()
+		delete(a.ctxLive, ctx)
+		a.ctxLiveMu.Unlock()
+	}
+
+	if !wait {
+		return
+	}
+
+	for f := range funcs {
+		(*f)()
+	}
+
+	// Wait out concurrently canceling goroutines
+	ctx.cancelMu.Lock()
+
+	for ctx.pendingCancels > 0 {
+		if ctx.cancelIdle == nil {
+			ctx.cancelIdle = sync.NewCond(&ctx.cancelMu)
+		}
+
+		ctx.cancelIdle.Wait()
+	}
+
+	ctx.ctxErr = nil
+	ctx.cancelMu.Unlock()
 }
 
 // RequestHandler must process incoming requests.
@@ -173,6 +266,11 @@ func Handle(h Handler) RequestHandler {
 }
 
 func (c *Context) reset() {
+	if c.reqCtxStop != nil {
+		c.reqCtxStop()
+		c.reqCtxStop = nil
+	}
+
 	c.Form.form.Reset(c)
 	c.Form.form = nilArgsValuer
 	c.user = nil

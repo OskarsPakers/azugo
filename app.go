@@ -34,6 +34,10 @@ type App struct {
 	ctxPool sync.Pool
 	ctxExt  ExtendedContext
 
+	// Live request contexts with their generation, canceled on server shutdown.
+	ctxLiveMu sync.Mutex
+	ctxLive   map[*Context]uint64
+
 	// Configuration
 	config *config.Configuration
 
@@ -88,6 +92,7 @@ func New(opts ...*core.App) *App {
 		entropy: &ulid.LockedMonotonicReader{
 			MonotonicReader: ulid.Monotonic(rand.Reader, 0),
 		},
+		ctxLive: make(map[*Context]uint64),
 
 		ServerOptions: ServerOptions{
 			RequestReadBufferSize:   8192,
@@ -276,6 +281,24 @@ func (a *App) Stop() {
 	server, h2server := a.server, a.h2server
 	a.server, a.h2server = nil, nil
 	a.serverLock.Unlock()
+
+	// Cancel in-flight request contexts so handlers can finish early
+	type liveCtx struct {
+		ctx *Context
+		gen uint64
+	}
+
+	a.ctxLiveMu.Lock()
+	live := make([]liveCtx, 0, len(a.ctxLive))
+
+	for ctx, gen := range a.ctxLive {
+		live = append(live, liveCtx{ctx: ctx, gen: gen})
+	}
+	a.ctxLiveMu.Unlock()
+
+	for _, lc := range live {
+		lc.ctx.cancel(lc.gen, context.Canceled)
+	}
 
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), a.Config().Server.ShutdownTimeout)

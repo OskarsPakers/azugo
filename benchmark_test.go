@@ -1,7 +1,9 @@
 package azugo
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/valyala/fasthttp"
 )
@@ -23,6 +25,32 @@ func BenchmarkContextAcquireRelease(b *testing.B) {
 	for b.Loop() {
 		c := app.acquireCtx(app.defaultMux, "/test", ctx)
 		app.releaseCtx(c)
+	}
+}
+
+func BenchmarkContextDeriveCancellable(b *testing.B) {
+	m := newMux(NewTestApp().App)
+	m.Get("/test", func(ctx *Context) {
+		child, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+
+		_ = child
+	})
+
+	var req fasthttp.Request
+
+	req.Header.SetMethod("GET")
+	req.SetRequestURI("/test")
+
+	// Init attaches a served state so Done delegation is valid outside a
+	// running server.
+	ctx := new(fasthttp.RequestCtx)
+	ctx.Init(&req, nil, nil)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		m.Handler(ctx)
 	}
 }
 

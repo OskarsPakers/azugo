@@ -20,7 +20,28 @@ var requestContextKey requestContextKeyType
 // Passing a nil ctx resets the effective context back to the base request
 // context.
 func (c *Context) SetContext(ctx context.Context) {
+	if c.reqCtxStop != nil {
+		c.reqCtxStop()
+		c.reqCtxStop = nil
+	}
+
 	c.reqCtx = ctx
+
+	if ctx == nil {
+		return
+	}
+
+	// Bridge cancellation of the installed context to the request lifecycle
+	if d := ctx.Done(); d != nil && (c.context == nil || d != c.context.Done()) {
+		c.cancelMu.Lock()
+		c.touched.Store(true)
+		gen := c.gen
+		c.cancelMu.Unlock()
+
+		c.reqCtxStop = context.AfterFunc(ctx, func() {
+			c.cancel(gen, ctx.Err())
+		})
+	}
 }
 
 func (c *Context) effectiveContext() context.Context {
@@ -48,56 +69,159 @@ func (c *Context) Deadline() (time.Time, bool) {
 	return c.effectiveContext().Deadline()
 }
 
-// Done returns a channel that's closed when work done on behalf of this
-// context should be canceled. Done may return nil if this context can
-// never be canceled. Successive calls to Done return the same value.
-// The close of the Done channel may happen asynchronously,
-// after the cancel function returns.
-//
-// WithCancel arranges for Done to be closed when cancel is called;
-// WithDeadline arranges for Done to be closed when the deadline
-// expires; WithTimeout arranges for Done to be closed when the timeout
-// elapses.
-//
-// Done is provided for use in select statements:
-//
-//	// Stream generates values with DoSomething and sends them to out
-//	// until DoSomething returns an error or ctx.Done is closed.
-//	func Stream(ctx context.Context, out chan<- Value) error {
-//		for {
-//			v, err := DoSomething(ctx)
-//			if err != nil {
-//				return err
-//			}
-//			select {
-//			case <-ctx.Done():
-//				return ctx.Err()
-//			case out <- v:
-//			}
-//		}
-//	}
-//
-// See https://blog.golang.org/pipelines for more examples of how to use
-// a Done channel for cancellation.
+// Done returns a channel that is closed when the request completes, the
+// server is shutting down or a cancellable context installed via SetContext
+// is canceled. The channel is created lazily and is safe to hand to code
+// that outlives the handler.
 func (c *Context) Done() <-chan struct{} {
-	if c == nil || c.context == nil {
+	if c == nil {
 		return nil
 	}
 
-	return c.effectiveContext().Done()
+	if d := c.doneCh.Load(); d != nil {
+		return *d
+	}
+
+	c.cancelMu.Lock()
+
+	d := c.doneCh.Load()
+	if d == nil {
+		c.touched.Store(true)
+
+		ch := make(chan struct{})
+		if c.ctxErr != nil {
+			close(ch)
+		}
+
+		c.doneCh.Store(&ch)
+		d = &ch
+	}
+
+	c.cancelMu.Unlock()
+
+	c.markLive()
+
+	return *d
 }
 
-// Err returns nil if Done is not yet closed.
-// If Done is closed, Err returns a non-nil error explaining why:
-// Canceled if the context was canceled
-// or DeadlineExceeded if the context's deadline passed.
-// After Err returns a non-nil error, successive calls to Err return the same error.
+// Err returns nil while the request is being served and a non-nil error
+// after the Context has been canceled.
 func (c *Context) Err() error {
-	if c == nil || c.context == nil {
+	if c == nil {
 		return nil
 	}
 
-	return c.effectiveContext().Err()
+	c.cancelMu.Lock()
+	defer c.cancelMu.Unlock()
+
+	return c.ctxErr
+}
+
+// AfterFunc registers f to run once the Context is canceled and returns a
+// stop function reporting whether it removed the registration.
+func (c *Context) AfterFunc(f func()) func() bool {
+	c.cancelMu.Lock()
+
+	c.touched.Store(true)
+
+	if c.ctxErr != nil {
+		c.pendingCancels++
+		c.cancelMu.Unlock()
+
+		go func() {
+			f()
+
+			c.donePendingCancel()
+		}()
+
+		return func() bool { return false }
+	}
+
+	if c.afterFuncs == nil {
+		c.afterFuncs = make(map[*func()]struct{})
+	}
+
+	k := &f
+	c.afterFuncs[k] = struct{}{}
+
+	c.cancelMu.Unlock()
+
+	c.markLive()
+
+	return func() bool {
+		c.cancelMu.Lock()
+		defer c.cancelMu.Unlock()
+
+		_, ok := c.afterFuncs[k]
+		delete(c.afterFuncs, k)
+
+		return ok
+	}
+}
+
+// cancel ends the request lifecycle: Err starts returning err, the done
+// channel is closed and registered after funcs run.
+func (c *Context) cancel(gen uint64, err error) {
+	c.cancelMu.Lock()
+
+	if c.ctxErr != nil || gen != c.gen {
+		c.cancelMu.Unlock()
+
+		return
+	}
+
+	c.ctxErr = err
+
+	if d := c.doneCh.Load(); d != nil {
+		close(*d)
+	}
+
+	funcs := c.afterFuncs
+	c.afterFuncs = nil
+
+	if funcs == nil {
+		c.cancelMu.Unlock()
+
+		return
+	}
+
+	// Canceling a child re-enters Err and Value
+	c.pendingCancels++
+	c.cancelMu.Unlock()
+
+	for f := range funcs {
+		(*f)()
+	}
+
+	c.donePendingCancel()
+}
+
+// donePendingCancel marks one canceling goroutine as finished.
+func (c *Context) donePendingCancel() {
+	c.cancelMu.Lock()
+
+	c.pendingCancels--
+	if c.pendingCancels == 0 && c.cancelIdle != nil {
+		c.cancelIdle.Broadcast()
+	}
+
+	c.cancelMu.Unlock()
+}
+
+// markLive registers the Context to be canceled on server shutdown.
+func (c *Context) markLive() {
+	c.cancelMu.Lock()
+	defer c.cancelMu.Unlock()
+
+	if c.live || c.ctxErr != nil || c.app == nil {
+		return
+	}
+
+	c.live = true
+
+	c.app.ctxLiveMu.Lock()
+	c.app.ctxLive[c] = c.gen
+	c.app.ctxLiveMu.Unlock()
 }
 
 // Value returns the value associated with this context for key, or nil

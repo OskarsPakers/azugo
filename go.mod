@@ -3,7 +3,7 @@ module azugo.io/azugo
 go 1.25.0
 
 require (
-	azugo.io/core v0.37.1
+	azugo.io/core v0.37.2
 	github.com/VictoriaMetrics/metrics v1.44.0
 	github.com/beevik/etree v1.7.0
 	github.com/go-playground/validator/v10 v10.30.3
@@ -22,6 +22,7 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
+	github.com/cenkalti/backoff/v7 v7.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
