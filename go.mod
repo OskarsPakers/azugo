@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	azugo.io/core v0.37.2
 	github.com/VictoriaMetrics/metrics v1.44.0
-	github.com/beevik/etree v1.7.0
+	github.com/beevik/etree v1.7.1
 	github.com/go-playground/validator/v10 v10.30.3
 	github.com/go-quicktest/qt v1.102.0
 	github.com/goccy/go-json v0.10.6
