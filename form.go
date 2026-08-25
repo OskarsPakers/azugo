@@ -161,7 +161,7 @@ func (f *FormCtx) Int64(key string) (int64, error) {
 
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, ParamInvalidError{key, "numeric", err}
+		return 0, ParamInvalidError{key, paramTagNumeric, err}
 	}
 
 	return v, nil
@@ -176,7 +176,7 @@ func (f *FormCtx) Int64Optional(key string) (*int64, error) {
 
 	v, err := strconv.ParseInt(*s, 10, 64)
 	if err != nil {
-		return nil, ParamInvalidError{key, "numeric", err}
+		return nil, ParamInvalidError{key, paramTagNumeric, err}
 	}
 
 	return &v, nil

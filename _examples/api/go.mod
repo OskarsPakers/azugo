@@ -1,6 +1,6 @@
 module example/api
 
-go 1.25.0
+go 1.26.0
 
 require (
 	azugo.io/azugo v0.0.0

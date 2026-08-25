@@ -4,6 +4,9 @@ import (
 	"strconv"
 )
 
+// paramTagNumeric is the validator tag used for numeric parse errors.
+const paramTagNumeric = "numeric"
+
 // ParamsCtx represents the parameters of route URL.
 type ParamsCtx struct {
 	noCopy noCopy
@@ -40,7 +43,7 @@ func (p *ParamsCtx) Int64(key string) (int64, error) {
 
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, ParamInvalidError{key, "numeric", err}
+		return 0, ParamInvalidError{key, paramTagNumeric, err}
 	}
 
 	return v, nil

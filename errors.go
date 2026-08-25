@@ -40,7 +40,7 @@ func fromSafeError(err SafeError) *http.ErrorResponseError {
 	}
 
 	t := reflect.TypeOf(err)
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 

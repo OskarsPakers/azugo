@@ -151,7 +151,7 @@ func (c *Context) SetPaging(values map[string]string, paginator *paginator.Pagin
 
 	curl, err := url.Parse(c.BaseURL() + route)
 	if err != nil {
-		c.Log().Error("Failed to prepare paging header", zap.Error((err)))
+		c.Log().Error("Failed to prepare paging header", zap.Error(err))
 
 		return
 	}

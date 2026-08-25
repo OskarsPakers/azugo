@@ -1,6 +1,6 @@
 module azugo.io/azugo
 
-go 1.25.0
+go 1.26.0
 
 require (
 	azugo.io/core v0.38.0

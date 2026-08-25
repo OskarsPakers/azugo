@@ -25,7 +25,7 @@ func (u *Basic) UnmarshalJSON(data []byte) error {
 }
 
 // MarshalJSON implements json.Marshaler for Basic.
-func (u Basic) MarshalJSON() ([]byte, error) {
+func (u *Basic) MarshalJSON() ([]byte, error) {
 	return json.Marshal(basicClaims{
 		Claims: u.claims,
 	})
