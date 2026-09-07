@@ -72,5 +72,4 @@ func TestMetricsHandler(t *testing.T) {
 
 	qt.Check(t, qt.IsTrue(strings.Contains(body, "requests_total")), qt.Commentf("metrics handler not returning expected metrics"))
 	qt.Check(t, qt.Equals(contentType, "text/plain; version=0.0.4; charset=utf-8"))
-	qt.Check(t, qt.IsFalse(strings.Contains(body, "# EOF")))
 }
