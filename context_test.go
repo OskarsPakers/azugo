@@ -468,3 +468,60 @@ func TestDerivedCancellableContextDoesNotRaceRelease(t *testing.T) {
 		fasthttp.ReleaseResponse(resp)
 	}
 }
+
+// A Done call that races the end of a request — here from an AfterFunc,
+// which runs while the lifecycle is ending — must not leave a closed done
+// channel behind for the next occupant of the pooled Context. Previously the
+// cached channel was closed a second time when the Context was reused,
+// panicking with "close of closed channel" and crashing the server.
+// Database drivers (database/sql, pgx) watch request contexts this way.
+func TestLateDoneDuringReleaseDoesNotPanicOnReuse(t *testing.T) {
+	app := NewTestApp()
+
+	app.Start(t)
+	defer app.Stop()
+
+	// Context.AfterFunc runs the callback inside the release, which is the
+	// window a driver's watcher goroutine can hit under load.
+	app.Get("/test", func(ctx *Context) {
+		ctx.AfterFunc(func() {
+			<-ctx.Done()
+		})
+	})
+
+	for range 50 {
+		resp, err := app.TestClient().Get("/test")
+		qt.Assert(t, qt.IsNil(err))
+		qt.Check(t, qt.Equals(resp.StatusCode(), fasthttp.StatusOK))
+		fasthttp.ReleaseResponse(resp)
+	}
+}
+
+// A late Done after the request ended returns a channel that is already
+// closed, and the next request on the recycled Context gets a fresh one.
+func TestLateDoneAfterReleaseIsClosedAndNextRequestIsLive(t *testing.T) {
+	ctx := &Context{}
+	app := NewTestApp()
+	ctx.app = app.App
+
+	done := make(chan (<-chan struct{}), 1)
+	ctx.AfterFunc(func() { done <- ctx.Done() })
+
+	app.App.endCtxLifecycle(ctx)
+
+	select {
+	case <-<-done:
+	case <-time.After(time.Second):
+		t.Fatal("Done from the ending request was not closed")
+	}
+
+	qt.Check(t, qt.IsNil(ctx.Err()))
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("Done of the recycled Context is already closed")
+	default:
+	}
+
+	app.App.endCtxLifecycle(ctx)
+}

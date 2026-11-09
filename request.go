@@ -237,6 +237,12 @@ func (a *App) endCtxLifecycle(ctx *Context) {
 	}
 
 	ctx.ctxErr = nil
+
+	// A Done call made while the funcs ran saw ctxErr set and cached an
+	// already-closed channel. Drop it with the error: otherwise the next
+	// occupant starts out done, and the next lifecycle end closes the
+	// channel again and panics.
+	ctx.doneCh.Store(nil)
 	ctx.cancelMu.Unlock()
 }
 
